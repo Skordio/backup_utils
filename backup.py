@@ -15,6 +15,7 @@ import os
 import shutil
 import signal
 import string
+import subprocess
 import sys
 import time
 import zipfile
@@ -522,41 +523,65 @@ def find_incomplete(source, dest_base):
 # --------------------------------------------------------------------------- #
 # Archiving
 # --------------------------------------------------------------------------- #
-def zip_backup(destination, verbosity, use_vt, compress=True):
-    """Compress everything in ``destination`` into a sibling .zip.
+def find_7zip():
+    """Return a path to a 7-Zip executable, or None. Checks PATH first, then the
+    standard Windows install locations (7-Zip is commonly installed but not on
+    PATH). 7-Zip compresses zip entries across all cores, several times faster
+    than the single-threaded stdlib writer."""
+    for name in ("7z", "7za"):
+        found = shutil.which(name)
+        if found:
+            return found
+    if os.name == "nt":
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            cand = Path(base) / "7-Zip" / "7z.exe"
+            if cand.is_file():
+                return str(cand)
+    return None
 
-    Returns (archive_path, ok). ``ok`` is False if the archive could not be
-    written or fails verification, in which case the caller must keep the
-    uncompressed folder.
-    """
-    archive = destination.with_name(destination.name + ".zip")
 
-    entries = []
-    empty_dirs = []
-    total = 0
-    for root, dirs, names in os.walk(destination):
-        for name in names:
-            p = Path(root) / name
-            try:
-                total += p.stat().st_size
-            except OSError:
-                pass
-            entries.append(p)
-        # Preserve leaf directories that hold no files or subdirs; writing the
-        # per-dir entry recreates any intermediate parents on extraction too.
-        if not names and not dirs and Path(root) != destination:
-            empty_dirs.append(Path(root))
+def _zip_with_7zip(sevenzip, destination, archive, compress):
+    """Build ``archive`` from the contents of ``destination`` using 7-Zip
+    (multithreaded). Returns True on success. Output stays a standard .zip --
+    the caller verifies it with the stdlib reader just like the stdlib writer."""
+    if archive.exists():
+        try:
+            archive.unlink()  # 7z would *update* an existing archive, not replace
+        except OSError as exc:
+            print(f"  ! Could not replace existing archive: {exc}")
+            return False
+    print(f"  Using 7-Zip (multithreaded): {sevenzip}")
+    level = "-mx=6" if compress else "-mx=0"
+    # cwd=destination + '*' stores paths relative to the backup root (incl. empty
+    # dirs and dot-prefixed files). -bso0 hides the file list; -bsp1 shows the
+    # live percentage; errors still arrive on stderr.
+    cmd = [sevenzip, "a", "-tzip", level, "-mmt=on", "-bso0", "-bsp1",
+           "--", str(archive), "*"]
+    try:
+        result = subprocess.run(cmd, cwd=str(destination), stderr=subprocess.PIPE,
+                                text=True)
+    except OSError as exc:
+        print(f"  ! Could not run 7-Zip: {exc}")
+        return False
+    if result.returncode != 0:
+        print(f"  ! 7-Zip failed (exit {result.returncode}). "
+              f"{(result.stderr or '').strip()[:300]}")
+        return False
+    return True
 
-    print(f"\nCompressing {len(entries)} files into {archive.name} ...")
+
+def _zip_with_stdlib(destination, archive, entries, empty_dirs, total,
+                     verbosity, use_vt, compress):
+    """Single-threaded stdlib writer. Returns (ok, manifest) where manifest maps
+    each archived file name to its uncompressed size (successfully written files
+    only)."""
     method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
     display = ProgressDisplay(total, verbosity, use_vt=use_vt,
                               total_files=len(entries))
     done = 0
     written = 0
-    # Maps each archived name to its expected uncompressed size so verification
-    # can confirm every file is present and whole, not merely CRC-clean.
     manifest = {}
-    expected_dirs = set()
     try:
         with zipfile.ZipFile(archive, "w", method, allowZip64=True) as zf:
             for p in entries:
@@ -576,13 +601,59 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
                 rel = d.relative_to(destination)
                 try:
                     zf.write(d, str(rel))
-                    expected_dirs.add(str(rel).replace(os.sep, "/").rstrip("/") + "/")
                 except OSError as exc:
                     display.log(f"  ! zip failed (dir): {rel} -- {exc}")
         display.close(completed=True)
     except OSError as exc:
         display.close(completed=False)
         print(f"  ! Could not create archive: {exc}")
+        return False, manifest
+    return True, manifest
+
+
+def zip_backup(destination, verbosity, use_vt, compress=True):
+    """Compress everything in ``destination`` into a sibling .zip.
+
+    Uses 7-Zip (multithreaded) when available, else the stdlib writer; either
+    way the result is a standard .zip verified with the stdlib reader before the
+    caller is allowed to delete the source folder. Returns (archive_path, ok).
+    """
+    archive = destination.with_name(destination.name + ".zip")
+
+    entries = []
+    empty_dirs = []
+    total = 0
+    for root, dirs, names in os.walk(destination):
+        for name in names:
+            p = Path(root) / name
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+            entries.append(p)
+        # Preserve leaf directories that hold no files or subdirs; writing the
+        # per-dir entry recreates any intermediate parents on extraction too.
+        if not names and not dirs and Path(root) != destination:
+            empty_dirs.append(Path(root))
+    expected_dirs = {str(d.relative_to(destination)).replace(os.sep, "/").rstrip("/") + "/"
+                     for d in empty_dirs}
+
+    print(f"\nCompressing {len(entries)} files into {archive.name} ...")
+    sevenzip = find_7zip()
+    if sevenzip:
+        # 7-Zip archives every entry or fails wholesale, so the expected manifest
+        # is the full file set (sizes from the scan).
+        manifest = {}
+        for p in entries:
+            try:
+                manifest[str(p.relative_to(destination)).replace(os.sep, "/")] = p.stat().st_size
+            except OSError:
+                pass
+        ok = _zip_with_7zip(sevenzip, destination, archive, compress)
+    else:
+        ok, manifest = _zip_with_stdlib(destination, archive, entries, empty_dirs,
+                                        total, verbosity, use_vt, compress)
+    if not ok:
         return archive, False
 
     # Verify before the caller is allowed to delete the source folder: CRC-check
@@ -604,7 +675,7 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
         return archive, False
 
     print(f"  Archived and verified: {archive} "
-          f"({human_bytes(archive.stat().st_size)}, {written} files)")
+          f"({human_bytes(archive.stat().st_size)}, {len(manifest)} files)")
     return archive, True
 
 
