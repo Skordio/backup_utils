@@ -25,6 +25,9 @@ DESTINATION_BASE = Path(r"C:\Users\skord\Backups\Flipper")
 MARKER_NAME = ".backup_incomplete.json"
 LOG_NAME = "backup.log"
 DOUBLE_PRESS_SECONDS = 5
+COPY_CHUNK = 1024 * 1024  # read/write granularity for the progress-aware copy
+PROGRESS_INTERVAL = 0.2   # min seconds between bar redraws during a single file
+SPEED_WINDOW = 3.0        # seconds of history used for the live transfer-speed figure
 
 
 # --------------------------------------------------------------------------- #
@@ -213,6 +216,8 @@ class ProgressDisplay:
         self.last_name = ""
         self.start = time.time()
         self._next_milestone = 10  # for non-TTY percentage reporting
+        self._samples = []         # (timestamp, done) history for rolling speed
+        self._last_render = 0.0    # last TTY redraw time, for update() throttling
 
     # -- internals ---------------------------------------------------------- #
     def _term_width(self):
@@ -223,6 +228,26 @@ class ProgressDisplay:
             return "\r\033[2K"
         return "\r" + " " * (self._term_width() - 1) + "\r"
 
+    def _record_sample(self, now, done):
+        """Remember (now, done) and drop history older than the speed window,
+        always keeping at least two points so a delta is available."""
+        self._samples.append((now, done))
+        cutoff = now - SPEED_WINDOW
+        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+
+    def _current_speed(self):
+        """Bytes/sec over the recent window; falls back to the cumulative
+        average until enough history exists. Reflects the file in flight."""
+        if len(self._samples) >= 2:
+            t0, d0 = self._samples[0]
+            t1, d1 = self._samples[-1]
+            span = t1 - t0
+            if span > 0:
+                return max(0.0, (d1 - d0) / span)
+        elapsed = time.time() - self.start
+        return (self.done / elapsed) if elapsed > 0 else 0.0
+
     def _render_bar(self):
         term = self._term_width()
         frac = (self.done / self.total) if self.total else 1.0
@@ -230,9 +255,11 @@ class ProgressDisplay:
         elapsed = time.time() - self.start
         rate = self.done / elapsed if elapsed > 0 else 0
         eta = (self.total - self.done) / rate if rate > 0 else 0
+        speed = f"{human_bytes(self._current_speed())}/s"
         suffix = (
             f" {frac * 100:5.1f}%  "
             f"{human_bytes(self.done)}/{human_bytes(self.total)}  "
+            f"{speed:>10}  "
             f"ETA {int(eta):4d}s"
         )
         # Size the bar to the terminal (2 cols for the brackets) so the whole
@@ -256,11 +283,18 @@ class ProgressDisplay:
     # -- public API --------------------------------------------------------- #
     # Each method emits its escape sequence + text in a single write() so a
     # SIGINT landing mid-render can't interleave a half-drawn line.
-    def update(self, done, name=None):
+    def update(self, done, name=None, min_interval=0.0):
+        now = time.time()
         self.done = done
         if name is not None:
             self.last_name = name
+        self._record_sample(now, done)
         if self.is_tty:
+            # Throttle terminal writes during a single large file; state above
+            # is already current, so a skipped frame loses nothing.
+            if min_interval and (now - self._last_render) < min_interval:
+                return
+            self._last_render = now
             self.stream.write(self._clear_seq() + self._render_bar())
             self.stream.flush()
         else:
@@ -454,6 +488,28 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
 # --------------------------------------------------------------------------- #
 # Backup
 # --------------------------------------------------------------------------- #
+def copy_with_progress(src, dst, on_chunk):
+    """Copy ``src`` to ``dst`` like ``shutil.copy2`` (data + metadata), invoking
+    ``on_chunk(file_bytes_so_far)`` after each chunk so a large file keeps the
+    progress bar moving instead of blocking on one monolithic copy. Returns the
+    number of bytes copied.
+
+    ``copy2`` == ``copyfile`` + ``copystat``; replicating ``copystat`` preserves
+    the mtime/mode that the resume-skip check relies on.
+    """
+    copied = 0
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(COPY_CHUNK)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            copied += len(chunk)
+            on_chunk(copied)
+    shutil.copystat(src, dst)
+    return copied
+
+
 def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                use_vt=True, make_zip=False, zip_keep=False, zip_compress=True,
                dest_base=DESTINATION_BASE):
@@ -550,7 +606,9 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
         now = time.time()
         if interrupt["first"] is not None and now - interrupt["first"] <= DOUBLE_PRESS_SECONDS:
             interrupt["stop"] = True
-            display.log("  ^C again -- stopping after the current file finishes...")
+            display.log("  ^C again -- will stop once the current file finishes. "
+                        "A large file may take a moment; the %/speed keep updating "
+                        "until then.")
         else:
             interrupt["first"] = now
             display.log(
@@ -604,12 +662,16 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                                 f"({human_bytes(size)})")
                 elif verbosity >= 1:
                     display.log(f"  {rel}")
-                shutil.copy2(src, dst)
+                base = copied_bytes + skipped_bytes  # progress before this file
+                display.update(base, name=str(rel), min_interval=PROGRESS_INTERVAL)
+                n = copy_with_progress(
+                    src, dst,
+                    lambda file_done, base=base, rel=rel: display.update(
+                        base + file_done, name=str(rel),
+                        min_interval=PROGRESS_INTERVAL),
+                )
                 copied_count += 1
-                try:
-                    copied_bytes += src.stat().st_size
-                except OSError:
-                    pass
+                copied_bytes += n
                 log_line(log, f"OK    {rel}")
             except (OSError, shutil.Error) as exc:
                 errors.append((rel, str(exc)))
