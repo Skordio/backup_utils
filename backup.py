@@ -340,13 +340,13 @@ def clear_marker(destination):
         pass
 
 
-def find_incomplete(source):
+def find_incomplete(source, dest_base):
     """Return the most recent incomplete backup folder for a source, or None."""
-    if not DESTINATION_BASE.exists():
+    if not dest_base.exists():
         return None
     key = str(source)
     candidates = []
-    for child in DESTINATION_BASE.iterdir():
+    for child in dest_base.iterdir():
         marker = child / MARKER_NAME
         if not marker.is_file():
             continue
@@ -455,7 +455,8 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
 # Backup
 # --------------------------------------------------------------------------- #
 def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
-               use_vt=True, make_zip=False, zip_keep=False, zip_compress=True):
+               use_vt=True, make_zip=False, zip_keep=False, zip_compress=True,
+               dest_base=DESTINATION_BASE):
     label = describe_source(source)
 
     # ------------------------------------------------------------------ #
@@ -473,7 +474,7 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
         destination = resume_choice
         resuming = True
     else:  # "AUTO" (bare --resume) or "PROMPT" (default: ask if one is found)
-        found = find_incomplete(source)
+        found = find_incomplete(source, dest_base)
         if found:
             name, folder, data = found
             done_hint = data.get("total_files", "?")
@@ -491,14 +492,14 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
 
     if destination is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        destination = DESTINATION_BASE / timestamp
+        destination = dest_base / timestamp
         # Second-resolution timestamps collide for back-to-back runs; bump a
         # suffix until both the folder and its .zip sibling are free so a fresh
         # backup never merges into (or overwrites) an earlier one.
         suffix = 1
         while (destination.exists()
                or destination.with_name(destination.name + ".zip").exists()):
-            destination = DESTINATION_BASE / f"{timestamp}_{suffix}"
+            destination = dest_base / f"{timestamp}_{suffix}"
             suffix += 1
 
     # Default log lives inside the backup folder itself.
@@ -711,6 +712,12 @@ def parse_args(argv):
         "kept as aliases.)",
     )
     parser.add_argument(
+        "-o", "--output",
+        metavar="DIR",
+        help="Base directory to write timestamped backup folders into. "
+        f"Defaults to {DESTINATION_BASE}.",
+    )
+    parser.add_argument(
         "-v", "--verbosity",
         type=int,
         choices=(0, 1, 2),
@@ -788,13 +795,16 @@ def main(argv=None):
     else:
         resume_choice = "PROMPT"
 
+    dest_base = Path(args.output).expanduser() if args.output else DESTINATION_BASE
+
     use_vt = enable_vt_mode()
 
     try:
         source = prompt_for_source(args.source)
         return run_backup(source, args.verbosity, args.yes, log_path,
                           resume_choice, use_vt=use_vt, make_zip=args.zip,
-                          zip_keep=args.zip_keep, zip_compress=not args.no_compress)
+                          zip_keep=args.zip_keep, zip_compress=not args.no_compress,
+                          dest_base=dest_base)
     except KeyboardInterrupt:
         # Only reachable outside the copy loop (e.g. during scan/prompt), where
         # nothing has been copied yet.
