@@ -9,6 +9,7 @@ Standard library only -- no third-party packages required.
 """
 
 import argparse
+import concurrent.futures
 import ctypes
 import json
 import os
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,8 @@ LOG_NAME = "backup.log"
 DOUBLE_PRESS_SECONDS = 5
 COPY_CHUNK = 1024 * 1024  # read/write granularity for the progress-aware copy
 PROGRESS_INTERVAL = 0.2   # min seconds between bar redraws during a single file
+ZIP_MT_BUDGET = 256 * 1024 * 1024  # max in-flight uncompressed bytes (bounds RAM)
+ZIP_MT_LARGE = 64 * 1024 * 1024    # files above this stream single-threaded
 SPEED_WINDOW = 3.0        # seconds of history used for the live transfer-speed figure
 ETA_WINDOW = 20.0         # seconds of history the ETA regression looks at
 ETA_SMOOTH = 0.25         # EWMA weight applied to the ETA output
@@ -541,7 +545,7 @@ def find_7zip():
     return None
 
 
-def _zip_with_7zip(sevenzip, destination, archive, compress):
+def _zip_with_7zip(sevenzip, destination, archive, compress, threads=None):
     """Build ``archive`` from the contents of ``destination`` using 7-Zip
     (multithreaded). Returns True on success. Output stays a standard .zip --
     the caller verifies it with the stdlib reader just like the stdlib writer."""
@@ -553,10 +557,11 @@ def _zip_with_7zip(sevenzip, destination, archive, compress):
             return False
     print(f"  Using 7-Zip (multithreaded): {sevenzip}")
     level = "-mx=6" if compress else "-mx=0"
+    mmt = f"-mmt={threads}" if threads else "-mmt=on"
     # cwd=destination + '*' stores paths relative to the backup root (incl. empty
     # dirs and dot-prefixed files). -bso0 hides the file list; -bsp1 shows the
     # live percentage; errors still arrive on stderr.
-    cmd = [sevenzip, "a", "-tzip", level, "-mmt=on", "-bso0", "-bsp1",
+    cmd = [sevenzip, "a", "-tzip", level, mmt, "-bso0", "-bsp1",
            "--", str(archive), "*"]
     try:
         result = subprocess.run(cmd, cwd=str(destination), stderr=subprocess.PIPE,
@@ -611,7 +616,143 @@ def _zip_with_stdlib(destination, archive, entries, empty_dirs, total,
     return True, manifest
 
 
-def zip_backup(destination, verbosity, use_vt, compress=True):
+def _compress_entry(path, arcname, compress):
+    """Thread-pool worker: read + CRC + deflate one file. Returns a tuple ready
+    for _write_zip_entry. zlib's crc32/deflate and the file read all release the
+    GIL, so a pool of these genuinely parallelises across cores. Falls back to
+    STORED when deflate doesn't shrink the file (or compression is off)."""
+    st = path.stat()
+    data = path.read_bytes()
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    dt = time.localtime(st.st_mtime)[:6]
+    if dt[0] < 1980:
+        dt = (1980, 1, 1, 0, 0, 0)  # zip epoch floor
+    ext_attr = (st.st_mode & 0xFFFF) << 16
+    if compress:
+        co = zlib.compressobj(6, zlib.DEFLATED, -15)  # raw DEFLATE stream
+        payload = co.compress(data) + co.flush()
+        if len(payload) < len(data):
+            return (arcname, dt, ext_attr, crc, len(data), payload, zipfile.ZIP_DEFLATED)
+    return (arcname, dt, ext_attr, crc, len(data), data, zipfile.ZIP_STORED)
+
+
+def _write_zip_entry(zf, result):
+    """Main-thread: inject a pre-compressed entry (from _compress_entry) into the
+    open ZipFile. Uses the public ZipInfo.FileHeader() for the local header and
+    lets ZipFile.close() build the central directory (incl. zip64). Only the main
+    thread touches zf.fp, so writes stay ordered. Returns the uncompressed size."""
+    arcname, dt, ext_attr, crc, file_size, payload, ctype = result
+    zi = zipfile.ZipInfo(arcname, dt)
+    zi.compress_type = ctype
+    zi.external_attr = ext_attr
+    zi.CRC = crc
+    zi.file_size = file_size
+    zi.compress_size = len(payload)
+    zi.header_offset = zf.fp.tell()
+    zf.fp.write(zi.FileHeader())
+    zf.fp.write(payload)
+    zf.start_dir = zf.fp.tell()
+    zf.filelist.append(zi)
+    zf.NameToInfo[zi.filename] = zi
+    zf._didModify = True
+    return file_size
+
+
+def _write_empty_dir_entry(zf, arcname):
+    """Write a zero-length directory entry the same way as _write_zip_entry."""
+    zi = zipfile.ZipInfo(arcname)
+    zi.compress_type = zipfile.ZIP_STORED
+    zi.external_attr = (0o40755 << 16) | 0x10  # dir mode + FILE_ATTRIBUTE_DIRECTORY
+    zi.CRC = 0
+    zi.file_size = 0
+    zi.compress_size = 0
+    zi.header_offset = zf.fp.tell()
+    zf.fp.write(zi.FileHeader())
+    zf.start_dir = zf.fp.tell()
+    zf.filelist.append(zi)
+    zf.NameToInfo[zi.filename] = zi
+    zf._didModify = True
+
+
+def _zip_with_threads(destination, archive, entries, empty_dirs, total,
+                      verbosity, use_vt, compress, workers):
+    """Multithreaded stdlib writer: compress files across a thread pool, write
+    entries from the main thread. Returns (ok, manifest). RAM is bounded by a
+    byte budget; files above ZIP_MT_LARGE stream single-threaded (a single file
+    can't be split into one parallel DEFLATE member anyway)."""
+    print(f"  Using built-in multithreaded zip ({workers} threads)")
+    display = ProgressDisplay(total, verbosity, use_vt=use_vt,
+                              total_files=len(entries))
+    method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    manifest = {}
+    done = 0
+    written = 0
+    pending = iter(entries)
+    exhausted = False
+    inflight = {}          # future -> input size
+    inflight_bytes = 0
+    try:
+        with zipfile.ZipFile(archive, "w", allowZip64=True) as zf, \
+                concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            while not exhausted or inflight:
+                # Fill the pool up to the byte budget / queue depth.
+                while (not exhausted and inflight_bytes < ZIP_MT_BUDGET
+                       and len(inflight) < workers * 3):
+                    p = next(pending, None)
+                    if p is None:
+                        exhausted = True
+                        break
+                    rel = str(p.relative_to(destination)).replace(os.sep, "/")
+                    try:
+                        size = p.stat().st_size
+                    except OSError as exc:
+                        display.log(f"  ! zip failed: {rel} -- {exc}")
+                        continue
+                    if size > ZIP_MT_LARGE:
+                        try:
+                            zf.write(p, rel, compress_type=method)
+                            manifest[rel] = size
+                            written += 1
+                            done += size
+                            if verbosity >= 2:
+                                display.log(f"  ZIP   {rel}")
+                            display.update(done, name=rel, files=written)
+                        except OSError as exc:
+                            display.log(f"  ! zip failed: {rel} -- {exc}")
+                        continue
+                    fut = pool.submit(_compress_entry, p, rel, compress)
+                    inflight[fut] = size
+                    inflight_bytes += size
+                # Drain whatever has finished (at least one).
+                if inflight:
+                    finished, _ = concurrent.futures.wait(
+                        inflight, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for fut in finished:
+                        inflight_bytes -= inflight.pop(fut)
+                        try:
+                            result = fut.result()
+                        except OSError as exc:
+                            display.log(f"  ! zip failed -- {exc}")
+                            continue
+                        done += _write_zip_entry(zf, result)
+                        written += 1
+                        manifest[result[0]] = result[4]
+                        if verbosity >= 2:
+                            display.log(f"  ZIP   {result[0]}")
+                        display.update(done, name=result[0], files=written)
+            for d in empty_dirs:
+                rel = str(d.relative_to(destination)).replace(os.sep, "/").rstrip("/") + "/"
+                _write_empty_dir_entry(zf, rel)
+            display.close(completed=True)
+    except OSError as exc:
+        display.close(completed=False)
+        print(f"  ! Could not create archive: {exc}")
+        return False, manifest
+    return True, manifest
+
+
+def zip_backup(destination, verbosity, use_vt, compress=True, engine="auto",
+               threads=None):
     """Compress everything in ``destination`` into a sibling .zip.
 
     Uses 7-Zip (multithreaded) when available, else the stdlib writer; either
@@ -639,8 +780,11 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
                      for d in empty_dirs}
 
     print(f"\nCompressing {len(entries)} files into {archive.name} ...")
-    sevenzip = find_7zip()
-    if sevenzip:
+    sevenzip = find_7zip() if engine in ("auto", "7zip") else None
+    if engine == "7zip" and not sevenzip:
+        print("  ! 7-Zip not found; using the built-in writer instead.")
+
+    if sevenzip and engine != "builtin":
         # 7-Zip archives every entry or fails wholesale, so the expected manifest
         # is the full file set (sizes from the scan).
         manifest = {}
@@ -649,10 +793,28 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
                 manifest[str(p.relative_to(destination)).replace(os.sep, "/")] = p.stat().st_size
             except OSError:
                 pass
-        ok = _zip_with_7zip(sevenzip, destination, archive, compress)
+        ok = _zip_with_7zip(sevenzip, destination, archive, compress, threads)
     else:
-        ok, manifest = _zip_with_stdlib(destination, archive, entries, empty_dirs,
-                                        total, verbosity, use_vt, compress)
+        workers = threads if threads else max(1, (os.cpu_count() or 2) - 1)
+        if compress and workers > 1:
+            try:
+                ok, manifest = _zip_with_threads(destination, archive, entries,
+                                                 empty_dirs, total, verbosity,
+                                                 use_vt, compress, workers)
+            except Exception as exc:  # incl. any zipfile-internals drift
+                print(f"  ! Multithreaded zip failed ({exc}); "
+                      f"falling back to single-threaded.")
+                try:
+                    archive.unlink()
+                except OSError:
+                    pass
+                ok, manifest = _zip_with_stdlib(destination, archive, entries,
+                                                empty_dirs, total, verbosity,
+                                                use_vt, compress)
+        else:
+            ok, manifest = _zip_with_stdlib(destination, archive, entries,
+                                            empty_dirs, total, verbosity, use_vt,
+                                            compress)
     if not ok:
         return archive, False
 
@@ -706,7 +868,8 @@ def copy_with_progress(src, dst, on_chunk):
 
 def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                use_vt=True, make_zip=False, zip_keep=False, zip_compress=True,
-               dest_base=DESTINATION_BASE, eta_log_path=None):
+               dest_base=DESTINATION_BASE, eta_log_path=None,
+               zip_engine="auto", zip_threads=None):
     label = describe_source(source)
 
     # ------------------------------------------------------------------ #
@@ -931,7 +1094,8 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
             log.close()  # close so the log file is flushed into the archive
             log = None
         try:
-            archive, ok = zip_backup(destination, verbosity, use_vt, zip_compress)
+            archive, ok = zip_backup(destination, verbosity, use_vt, zip_compress,
+                                     engine=zip_engine, threads=zip_threads)
         except KeyboardInterrupt:
             # The backup itself is complete and verified; only the optional
             # archive was interrupted. Drop the partial .zip and keep the folder.
@@ -1035,6 +1199,21 @@ def parse_args(argv):
         "the data is already compressed, e.g. video/photos).",
     )
     parser.add_argument(
+        "--zip-engine",
+        choices=("auto", "7zip", "builtin"),
+        default="auto",
+        help="Which zip backend to use: auto (7-Zip if installed, else the "
+        "built-in multithreaded writer; default), 7zip (force 7-Zip), or "
+        "builtin (force the built-in multithreaded writer).",
+    )
+    parser.add_argument(
+        "--zip-threads",
+        type=int,
+        metavar="N",
+        help="Worker threads for the built-in zip writer (also passed to 7-Zip). "
+        "Defaults to one less than the CPU count.",
+    )
+    parser.add_argument(
         "--debug-eta",
         metavar="CSV",
         help="Diagnostic: log raw progress + ETA estimates to CSV each sample, "
@@ -1072,7 +1251,8 @@ def main(argv=None):
         return run_backup(source, args.verbosity, args.yes, log_path,
                           resume_choice, use_vt=use_vt, make_zip=args.zip,
                           zip_keep=args.zip_keep, zip_compress=not args.no_compress,
-                          dest_base=dest_base, eta_log_path=eta_log_path)
+                          dest_base=dest_base, eta_log_path=eta_log_path,
+                          zip_engine=args.zip_engine, zip_threads=args.zip_threads)
     except KeyboardInterrupt:
         # Only reachable outside the copy loop (e.g. during scan/prompt), where
         # nothing has been copied yet.
