@@ -66,8 +66,8 @@ def available_drives():
             for i, letter in enumerate(string.ascii_uppercase)
             if bitmask & (1 << i)
         ]
-    # Non-Windows fallback: just check common mount roots.
-    return [d for d in string.ascii_uppercase if Path(f"{d}:\\").exists()]
+    # No drive-letter concept off Windows; callers fall back to path input.
+    return []
 
 
 def volume_label(letter):
@@ -147,20 +147,24 @@ def prompt_for_source(preferred=None):
 # File enumeration
 # --------------------------------------------------------------------------- #
 def gather_files(source):
-    """Walk the source, returning (files, total_bytes).
+    """Walk the source, returning (files, total_bytes, empty_dirs).
 
-    files is a list of (src_path, relative_path) tuples. A single-file source
-    yields one entry whose relative path is just the file name.
+    files is a list of (src_path, relative_path) tuples. empty_dirs is a list of
+    relative paths for directories that contain no files or subdirs, so the copy
+    step can recreate them (the per-file copy only makes parents of files). A
+    single-file source yields one entry whose relative path is just the file
+    name and no empty dirs.
     """
     files = []
+    empty_dirs = []
     total = 0
     if source.is_file():
         try:
             total = source.stat().st_size
         except OSError:
             total = 0
-        return [(source, Path(source.name))], total
-    for root, _dirs, names in os.walk(source):
+        return [(source, Path(source.name))], total, empty_dirs
+    for root, dirs, names in os.walk(source):
         for name in names:
             src = Path(root) / name
             try:
@@ -169,7 +173,14 @@ def gather_files(source):
                 size = 0
             files.append((src, src.relative_to(source)))
             total += size
-    return files, total
+        # A leaf directory with nothing in it would otherwise vanish from the
+        # backup; record it so it can be recreated. (Parents are remade via
+        # mkdir(parents=True) when their own leaf entries are created.)
+        if not names and not dirs:
+            rel = Path(root).relative_to(source)
+            if str(rel) != ".":
+                empty_dirs.append(rel)
+    return files, total, empty_dirs
 
 
 def human_bytes(n):
@@ -365,8 +376,9 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
     archive = destination.with_name(destination.name + ".zip")
 
     entries = []
+    empty_dirs = []
     total = 0
-    for root, _dirs, names in os.walk(destination):
+    for root, dirs, names in os.walk(destination):
         for name in names:
             p = Path(root) / name
             try:
@@ -374,42 +386,64 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
             except OSError:
                 pass
             entries.append(p)
+        # Preserve leaf directories that hold no files or subdirs; writing the
+        # per-dir entry recreates any intermediate parents on extraction too.
+        if not names and not dirs and Path(root) != destination:
+            empty_dirs.append(Path(root))
 
     print(f"\nCompressing {len(entries)} files into {archive.name} ...")
     method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
     display = ProgressDisplay(total, verbosity, use_vt=use_vt)
     done = 0
     written = 0
+    # Maps each archived name to its expected uncompressed size so verification
+    # can confirm every file is present and whole, not merely CRC-clean.
+    manifest = {}
+    expected_dirs = set()
     try:
         with zipfile.ZipFile(archive, "w", method, allowZip64=True) as zf:
             for p in entries:
                 rel = p.relative_to(destination)
                 try:
+                    size = p.stat().st_size
                     zf.write(p, str(rel))
                     written += 1
-                    done += p.stat().st_size
+                    done += size
+                    manifest[str(rel).replace(os.sep, "/")] = size
                     if verbosity >= 2:
                         display.log(f"  ZIP   {rel}")
                 except OSError as exc:
                     display.log(f"  ! zip failed: {rel} -- {exc}")
                 display.update(done, name=str(rel))
+            for d in empty_dirs:
+                rel = d.relative_to(destination)
+                try:
+                    zf.write(d, str(rel))
+                    expected_dirs.add(str(rel).replace(os.sep, "/").rstrip("/") + "/")
+                except OSError as exc:
+                    display.log(f"  ! zip failed (dir): {rel} -- {exc}")
         display.close(completed=True)
     except OSError as exc:
         display.close(completed=False)
         print(f"  ! Could not create archive: {exc}")
         return archive, False
 
-    # Verify before the caller is allowed to delete the source folder.
+    # Verify before the caller is allowed to delete the source folder: CRC-check
+    # every entry, then confirm each expected file/dir is present and that files
+    # are the right size (catches truncated or dropped entries, not just bit rot).
     try:
         with zipfile.ZipFile(archive) as zf:
             bad = zf.testzip()
-            count = len(zf.namelist())
+            names = set(zf.namelist())
+            missing = [a for a, sz in manifest.items()
+                       if a not in names or zf.getinfo(a).file_size != sz]
+            missing += [d for d in expected_dirs if d not in names]
     except (OSError, zipfile.BadZipFile) as exc:
         print(f"  ! Archive verification failed: {exc}")
         return archive, False
-    if bad is not None or count != written:
+    if bad is not None or missing:
         print(f"  ! Archive verification failed "
-              f"(corrupt entry={bad}, {count} of {written} entries).")
+              f"(corrupt entry={bad}, {len(missing)} entries missing or wrong size).")
         return archive, False
 
     print(f"  Archived and verified: {archive} "
@@ -432,6 +466,10 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
     if resume_choice == "NONE":
         pass  # forced fresh
     elif isinstance(resume_choice, Path):
+        if not (resume_choice / MARKER_NAME).is_file():
+            print(f"\nCannot resume: no interrupted backup found at {resume_choice}")
+            print(f"  (expected a {MARKER_NAME} marker inside that folder).")
+            return 1
         destination = resume_choice
         resuming = True
     else:  # "AUTO" (bare --resume) or "PROMPT" (default: ask if one is found)
@@ -454,6 +492,14 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
     if destination is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         destination = DESTINATION_BASE / timestamp
+        # Second-resolution timestamps collide for back-to-back runs; bump a
+        # suffix until both the folder and its .zip sibling are free so a fresh
+        # backup never merges into (or overwrites) an earlier one.
+        suffix = 1
+        while (destination.exists()
+               or destination.with_name(destination.name + ".zip").exists()):
+            destination = DESTINATION_BASE / f"{timestamp}_{suffix}"
+            suffix += 1
 
     # Default log lives inside the backup folder itself.
     if log_path == "DEFAULT":
@@ -470,14 +516,21 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
             return 1
 
     print("\nScanning files...")
-    files, total_bytes = gather_files(source)
+    files, total_bytes, empty_dirs = gather_files(source)
     file_count = len(files)
-    if file_count == 0:
+    if file_count == 0 and not empty_dirs:
         print("Nothing to copy -- the source is empty or unreadable.")
         return 0
     print(f"Found {file_count} files, {human_bytes(total_bytes)} total.\n")
 
     destination.mkdir(parents=True, exist_ok=True)
+    # Recreate empty source directories up front so the backup mirrors the tree
+    # (the copy loop below only makes parents of the files it writes).
+    for rel in empty_dirs:
+        try:
+            (destination / rel).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     write_marker(destination, source, label, started, file_count, total_bytes)
 
@@ -507,6 +560,7 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
             )
 
     copied_bytes = 0
+    skipped_bytes = 0
     copied_count = 0
     skipped_count = 0
     errors = []
@@ -531,12 +585,12 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                     s_src, s_dst = src.stat(), dst.stat()
                     if (s_dst.st_size == s_src.st_size
                             and abs(s_dst.st_mtime - s_src.st_mtime) <= 2):
-                        copied_bytes += s_dst.st_size
+                        skipped_bytes += s_dst.st_size
                         skipped_count += 1
                         log_line(log, f"SKIP  {rel} (already present)")
                         if verbosity >= 2:
                             display.log(f"  SKIP  [{index}/{file_count}] {rel}")
-                        display.update(copied_bytes, name=str(rel))
+                        display.update(copied_bytes + skipped_bytes, name=str(rel))
                         continue
                 except OSError:
                     pass  # fall through and re-copy
@@ -562,7 +616,7 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                 if verbosity >= 1:
                     display.log(f"  ! Failed: {rel} -- {exc}")
 
-            display.update(copied_bytes, name=str(rel))
+            display.update(copied_bytes + skipped_bytes, name=str(rel))
     finally:
         signal.signal(signal.SIGINT, previous_handler)
 
@@ -571,15 +625,15 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
     elapsed = time.time() - display.start
     processed = copied_count + skipped_count
     print(f"\n{'Stopped' if interrupted else 'Done'} in {elapsed:.1f}s.")
-    summary = f"  Copied:  {copied_count} files"
+    summary = f"  Copied:  {copied_count} files ({human_bytes(copied_bytes)})"
     if skipped_count:
-        summary += f", skipped {skipped_count} already present"
-    summary += f" ({human_bytes(copied_bytes)})"
+        summary += (f", skipped {skipped_count} already present "
+                    f"({human_bytes(skipped_bytes)})")
     print(summary)
     log_line(log, f"{'INTERRUPTED' if interrupted else 'Finished'} in "
-                  f"{elapsed:.1f}s: {copied_count} copied, {skipped_count} skipped, "
-                  f"{len(errors)} failed, {processed}/{file_count} of source "
-                  f"({human_bytes(copied_bytes)})")
+                  f"{elapsed:.1f}s: {copied_count} copied ({human_bytes(copied_bytes)}), "
+                  f"{skipped_count} skipped ({human_bytes(skipped_bytes)}), "
+                  f"{len(errors)} failed, {processed}/{file_count} of source")
 
     if errors:
         print(f"  Failed:  {len(errors)} files")
@@ -614,7 +668,18 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
         if log:
             log.close()  # close so the log file is flushed into the archive
             log = None
-        archive, ok = zip_backup(destination, verbosity, use_vt, zip_compress)
+        try:
+            archive, ok = zip_backup(destination, verbosity, use_vt, zip_compress)
+        except KeyboardInterrupt:
+            # The backup itself is complete and verified; only the optional
+            # archive was interrupted. Drop the partial .zip and keep the folder.
+            archive = destination.with_name(destination.name + ".zip")
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+            print(f"\n  Archiving interrupted; uncompressed backup kept at {destination}")
+            return 0
         if ok and not zip_keep:
             try:
                 shutil.rmtree(destination)
