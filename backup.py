@@ -28,6 +28,13 @@ DOUBLE_PRESS_SECONDS = 5
 COPY_CHUNK = 1024 * 1024  # read/write granularity for the progress-aware copy
 PROGRESS_INTERVAL = 0.2   # min seconds between bar redraws during a single file
 SPEED_WINDOW = 3.0        # seconds of history used for the live transfer-speed figure
+ETA_WINDOW = 20.0         # seconds of history the ETA regression looks at
+ETA_SMOOTH = 0.25         # EWMA weight applied to the ETA output
+SAMPLE_INTERVAL = 0.1     # min seconds between recorded history samples (bounds memory)
+MIN_ETA_SPAN = 1.0        # need this much window time before showing an ETA number
+ETA_MIN_BW = 1_000_000    # bytes/sec; a per-byte rate slower than this is overhead, not streaming
+ETA_BYTE_FLOOR = 96_000_000  # window must move this many bytes before the byte term is trusted
+ETA_CAP_MULT = 2.0        # per-file-branch ETA can't exceed this x the cumulative-file-rate projection
 
 
 # --------------------------------------------------------------------------- #
@@ -205,8 +212,10 @@ class ProgressDisplay:
     percentage milestones, with no escape sequences.
     """
 
-    def __init__(self, total_bytes, verbosity, stream=None, use_vt=True):
+    def __init__(self, total_bytes, verbosity, stream=None, use_vt=True,
+                 total_files=0, eta_log_path=None):
         self.total = total_bytes
+        self.total_files = total_files
         self.verbosity = verbosity
         self.stream = stream if stream is not None else sys.stderr
         self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
@@ -216,8 +225,18 @@ class ProgressDisplay:
         self.last_name = ""
         self.start = time.time()
         self._next_milestone = 10  # for non-TTY percentage reporting
-        self._samples = []         # (timestamp, done) history for rolling speed
+        self._samples = []         # (timestamp, bytes_done, files_done) history
         self._last_render = 0.0    # last TTY redraw time, for update() throttling
+        self._last_sample_t = 0.0  # last recorded-sample time, for decimation
+        self._files_done = 0
+        self._kb = 0.0             # latest raw sec/byte coefficient (for debug log)
+        self._kf = 0.0             # latest raw sec/file coefficient (for debug log)
+        self._eta_ewma = None      # smoothed ETA seconds
+        self._eta_seconds = None   # latest ETA estimate (cached for render/log)
+        self._eta_log = open(eta_log_path, "w", encoding="utf-8") if eta_log_path else None
+        if self._eta_log:
+            self._eta_log.write("elapsed,bytes_done,total_bytes,files_done,"
+                                "total_files,speed_bps,kb,kf,eta_seconds\n")
 
     # -- internals ---------------------------------------------------------- #
     def _term_width(self):
@@ -228,43 +247,128 @@ class ProgressDisplay:
             return "\r\033[2K"
         return "\r" + " " * (self._term_width() - 1) + "\r"
 
-    def _record_sample(self, now, done):
-        """Remember (now, done) and drop history older than the speed window,
-        always keeping at least two points so a delta is available."""
-        self._samples.append((now, done))
-        cutoff = now - SPEED_WINDOW
+    def _record_sample(self, now, done, files):
+        """Remember (now, done, files); decimate to SAMPLE_INTERVAL and trim to
+        ETA_WINDOW. Returns True if a *new* sample was appended (vs. refreshing
+        the latest), so callers can recompute the ETA only when data changed."""
+        if self._samples and now - self._last_sample_t < SAMPLE_INTERVAL:
+            self._samples[-1] = (now, done, files)  # keep newest reading fresh
+            return False
+        self._samples.append((now, done, files))
+        self._last_sample_t = now
+        cutoff = now - ETA_WINDOW
         while len(self._samples) > 2 and self._samples[0][0] < cutoff:
             self._samples.pop(0)
+        return True
 
     def _current_speed(self):
-        """Bytes/sec over the recent window; falls back to the cumulative
-        average until enough history exists. Reflects the file in flight."""
-        if len(self._samples) >= 2:
-            t0, d0 = self._samples[0]
-            t1, d1 = self._samples[-1]
+        """Bytes/sec over the recent SPEED_WINDOW tail of the shared history;
+        falls back to the cumulative average until enough history exists."""
+        cutoff = self._samples[-1][0] - SPEED_WINDOW if self._samples else 0
+        tail = [s for s in self._samples if s[0] >= cutoff]
+        if len(tail) >= 2:
+            t0, d0, _ = tail[0]
+            t1, d1, _ = tail[-1]
             span = t1 - t0
             if span > 0:
                 return max(0.0, (d1 - d0) / span)
         elapsed = time.time() - self.start
         return (self.done / elapsed) if elapsed > 0 else 0.0
 
+    def _estimate_eta(self):
+        """Seconds remaining, modelling elapsed time as k_b*bytes + k_f*files via
+        least squares over the recent window (predictors normalised so the fit is
+        well-conditioned across the huge bytes-vs-files scale gap).
+
+        The per-file term is the robust backbone for tiny-file trees. The per-byte
+        term is only trusted during genuine streaming -- the window must have moved
+        ETA_BYTE_FLOOR bytes at a believable bandwidth -- otherwise overhead would
+        be misattributed to a giant per-byte cost and, times the remaining bytes,
+        blow the estimate up to hours. The per-file/fallback branch is capped at a
+        multiple of the cumulative file-rate projection; a real streaming estimate
+        is never capped (it would wreck big-file backups). Output is EWMA-smoothed
+        and returned; None until there is enough history. (Tuned against a real
+        ~30k-file Flipper backup; see git history.)"""
+        s = self._samples
+        if len(s) < 2 or s[-1][0] - s[0][0] < MIN_ETA_SPAN:
+            return None
+        t0, b0, f0 = s[0]
+        bs = self.total if self.total > 0 else 1.0
+        fs = self.total_files if self.total_files > 0 else 1.0
+
+        Sbb = Sff = Sbf = Sbt = Sft = 0.0
+        for (t, b, f) in s:
+            db, df, dt = (b - b0) / bs, (f - f0) / fs, t - t0
+            Sbb += db * db
+            Sff += df * df
+            Sbf += db * df
+            Sbt += db * dt
+            Sft += df * dt
+        det = Sbb * Sff - Sbf * Sbf
+
+        kb = kf = None                             # solve in normalised space
+        if det > 1e-9 * (Sbb * Sff + 1):
+            kb = (Sbt * Sff - Sft * Sbf) / det / bs
+            kf = (Sft * Sbb - Sbt * Sbf) / det / fs
+        kf_only = (Sft / Sff / fs) if Sff > 0 else None
+
+        rem_b = max(0, self.total - self.done)
+        rem_f = max(0, self.total_files - self._files_done)
+        win_bytes = s[-1][1] - s[0][1]
+        trust_bytes = (kb is not None and kb > 0 and win_bytes >= ETA_BYTE_FLOOR
+                       and kb <= 1.0 / ETA_MIN_BW)
+
+        capped = True
+        if trust_bytes and kf is not None and kf >= 0:
+            self._kb, self._kf = kb, kf
+            eta = kb * rem_b + kf * rem_f
+            capped = False                         # never clip a real streaming estimate
+        elif kf_only is not None:
+            self._kb, self._kf = 0.0, kf_only
+            eta = kf_only * rem_f
+        elif Sbb > 0:                              # files flat, only bytes moving
+            self._kb, self._kf = Sbt / Sbb / bs, 0.0
+            eta = self._kb * rem_b
+        else:
+            return None
+
+        if capped and self._files_done > 0:
+            elapsed = s[-1][0] - self.start      # latest sample time == "now"
+            if elapsed > 0:
+                eta = min(eta, ETA_CAP_MULT * rem_f / (self._files_done / elapsed))
+        eta = max(0.0, eta)
+
+        self._eta_ewma = eta if self._eta_ewma is None \
+            else ETA_SMOOTH * eta + (1 - ETA_SMOOTH) * self._eta_ewma
+        return self._eta_ewma
+
+    @staticmethod
+    def _format_eta(eta):
+        """Fixed-width 'ETA ...' string; h/m/s so it never overflows on long runs."""
+        if eta is None:
+            return "ETA  --"
+        s = int(eta)
+        if s < 60:
+            return f"ETA {s:3d}s"
+        if s < 3600:
+            return f"ETA {s // 60}m{s % 60:02d}s"
+        return f"ETA {s // 3600}h{(s % 3600) // 60:02d}m"
+
     def _render_bar(self):
         term = self._term_width()
         frac = (self.done / self.total) if self.total else 1.0
         frac = min(frac, 1.0)
-        elapsed = time.time() - self.start
-        rate = self.done / elapsed if elapsed > 0 else 0
-        eta = (self.total - self.done) / rate if rate > 0 else 0
         speed = f"{human_bytes(self._current_speed())}/s"
         suffix = (
             f" {frac * 100:5.1f}%  "
             f"{human_bytes(self.done)}/{human_bytes(self.total)}  "
             f"{speed:>10}  "
-            f"ETA {int(eta):4d}s"
+            f"{self._format_eta(self._eta_seconds):>8}"
         )
-        # Size the bar to the terminal (2 cols for the brackets) so the whole
-        # line fits and can't wrap.
-        bar_width = max(10, min(self.max_bar, term - len(suffix) - 2))
+        # Size the bar to the terminal: 2 cols for the brackets plus 1 the
+        # term-1 clamp below reserves, so a full-width line never gets its last
+        # character (e.g. the ETA unit) shaved off.
+        bar_width = max(10, min(self.max_bar, term - len(suffix) - 3))
         filled = int(bar_width * frac)
         bar = "#" * filled + "-" * (bar_width - filled)
         line = f"[{bar}]{suffix}"
@@ -283,12 +387,16 @@ class ProgressDisplay:
     # -- public API --------------------------------------------------------- #
     # Each method emits its escape sequence + text in a single write() so a
     # SIGINT landing mid-render can't interleave a half-drawn line.
-    def update(self, done, name=None, min_interval=0.0):
+    def update(self, done, name=None, min_interval=0.0, files=None):
         now = time.time()
         self.done = done
         if name is not None:
             self.last_name = name
-        self._record_sample(now, done)
+        if files is not None:
+            self._files_done = files
+        if self._record_sample(now, done, self._files_done):
+            self._eta_seconds = self._estimate_eta()  # recompute only on new data
+            self._log_eta(now)
         if self.is_tty:
             # Throttle terminal writes during a single large file; state above
             # is already current, so a skipped frame loses nothing.
@@ -313,9 +421,23 @@ class ProgressDisplay:
             self.stream.write(msg + "\n")
             self.stream.flush()
 
+    def _log_eta(self, now):
+        """Append a CSV row of raw inputs + estimate when --debug-eta is active."""
+        if not self._eta_log:
+            return
+        eta = "" if self._eta_seconds is None else f"{self._eta_seconds:.1f}"
+        self._eta_log.write(
+            f"{now - self.start:.2f},{self.done},{self.total},{self._files_done},"
+            f"{self.total_files},{self._current_speed():.0f},"
+            f"{self._kb or 0:.3e},{self._kf or 0:.3e},{eta}\n")
+        self._eta_log.flush()
+
     def close(self, completed=True):
         """Draw the final bar. Only a completed run is forced to 100%; an
         interrupted or partially-failed run keeps its true position."""
+        if self._eta_log:
+            self._eta_log.close()
+            self._eta_log = None
         if not self.is_tty:
             return
         if completed:
@@ -427,7 +549,8 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
 
     print(f"\nCompressing {len(entries)} files into {archive.name} ...")
     method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
-    display = ProgressDisplay(total, verbosity, use_vt=use_vt)
+    display = ProgressDisplay(total, verbosity, use_vt=use_vt,
+                              total_files=len(entries))
     done = 0
     written = 0
     # Maps each archived name to its expected uncompressed size so verification
@@ -448,7 +571,7 @@ def zip_backup(destination, verbosity, use_vt, compress=True):
                         display.log(f"  ZIP   {rel}")
                 except OSError as exc:
                     display.log(f"  ! zip failed: {rel} -- {exc}")
-                display.update(done, name=str(rel))
+                display.update(done, name=str(rel), files=written)
             for d in empty_dirs:
                 rel = d.relative_to(destination)
                 try:
@@ -512,7 +635,7 @@ def copy_with_progress(src, dst, on_chunk):
 
 def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                use_vt=True, make_zip=False, zip_keep=False, zip_compress=True,
-               dest_base=DESTINATION_BASE):
+               dest_base=DESTINATION_BASE, eta_log_path=None):
     label = describe_source(source)
 
     # ------------------------------------------------------------------ #
@@ -596,7 +719,8 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                   f"{label} -> {destination}")
     log_line(log, f"Source files: {file_count}, total {human_bytes(total_bytes)}")
 
-    display = ProgressDisplay(total_bytes, verbosity, use_vt=use_vt)
+    display = ProgressDisplay(total_bytes, verbosity, use_vt=use_vt,
+                              total_files=file_count, eta_log_path=eta_log_path)
 
     # Graceful interrupt: handler only records intent; the loop acts on it so
     # the in-flight copy always finishes (no half-written files).
@@ -649,7 +773,8 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                         log_line(log, f"SKIP  {rel} (already present)")
                         if verbosity >= 2:
                             display.log(f"  SKIP  [{index}/{file_count}] {rel}")
-                        display.update(copied_bytes + skipped_bytes, name=str(rel))
+                        display.update(copied_bytes + skipped_bytes, name=str(rel),
+                                       files=copied_count + skipped_count)
                         continue
                 except OSError:
                     pass  # fall through and re-copy
@@ -663,12 +788,14 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                 elif verbosity >= 1:
                     display.log(f"  {rel}")
                 base = copied_bytes + skipped_bytes  # progress before this file
-                display.update(base, name=str(rel), min_interval=PROGRESS_INTERVAL)
+                done_files = copied_count + skipped_count  # current file not done yet
+                display.update(base, name=str(rel), min_interval=PROGRESS_INTERVAL,
+                               files=done_files)
                 n = copy_with_progress(
                     src, dst,
-                    lambda file_done, base=base, rel=rel: display.update(
-                        base + file_done, name=str(rel),
-                        min_interval=PROGRESS_INTERVAL),
+                    lambda file_done, base=base, rel=rel, df=done_files:
+                        display.update(base + file_done, name=str(rel),
+                                       min_interval=PROGRESS_INTERVAL, files=df),
                 )
                 copied_count += 1
                 copied_bytes += n
@@ -679,7 +806,8 @@ def run_backup(source, verbosity, assume_yes, log_path, resume_choice,
                 if verbosity >= 1:
                     display.log(f"  ! Failed: {rel} -- {exc}")
 
-            display.update(copied_bytes + skipped_bytes, name=str(rel))
+            display.update(copied_bytes + skipped_bytes, name=str(rel),
+                           files=copied_count + skipped_count)
     finally:
         signal.signal(signal.SIGINT, previous_handler)
 
@@ -835,6 +963,12 @@ def parse_args(argv):
         help="With --zip, store files without compression (faster; best when "
         "the data is already compressed, e.g. video/photos).",
     )
+    parser.add_argument(
+        "--debug-eta",
+        metavar="CSV",
+        help="Diagnostic: log raw progress + ETA estimates to CSV each sample, "
+        "for tuning the ETA model. Safe to ignore.",
+    )
     return parser.parse_args(argv)
 
 
@@ -858,6 +992,7 @@ def main(argv=None):
         resume_choice = "PROMPT"
 
     dest_base = Path(args.output).expanduser() if args.output else DESTINATION_BASE
+    eta_log_path = Path(args.debug_eta).expanduser() if args.debug_eta else None
 
     use_vt = enable_vt_mode()
 
@@ -866,7 +1001,7 @@ def main(argv=None):
         return run_backup(source, args.verbosity, args.yes, log_path,
                           resume_choice, use_vt=use_vt, make_zip=args.zip,
                           zip_keep=args.zip_keep, zip_compress=not args.no_compress,
-                          dest_base=dest_base)
+                          dest_base=dest_base, eta_log_path=eta_log_path)
     except KeyboardInterrupt:
         # Only reachable outside the copy loop (e.g. during scan/prompt), where
         # nothing has been copied yet.
